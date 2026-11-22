@@ -319,19 +319,33 @@ the middle of writing a line gets the signal right after that line (see
           (finish-output target))))
   (call-next-method))
 
+#+sbcl
+(defun %std-fd (stream)
+  "The OS descriptor under SBCL's standard stream STREAM (SB-SYS:*STDIN* /
+*STDOUT*): fd 0 / 1 on Unix, but the process's standard HANDLE on Windows,
+where SBCL fd-streams wrap HANDLEs and fd 0 / 1 are not stdin / stdout."
+  (and (typep stream 'sb-sys:fd-stream) (sb-sys:fd-stream-fd stream)))
+
 (defun %agent-streams (input output)
   "→ (values INPUT OUTPUT RAW-STDOUT) for the agent's transport. The defaulted
-stdin / stdout are UTF-8 streams on fd 0 / 1 (SBCL) inside wrappers whose
-close does not close them (a concatenated stream; %GUARD-OUTPUT with
-CLOSE-TARGET-P NIL). RAW-STDOUT is the defaulted stdout stream, or NIL."
+stdin / stdout are UTF-8 streams on the descriptors under SB-SYS:*STDIN* /
+*STDOUT* (SBCL; %STD-FD) inside wrappers whose close does not close them (a
+concatenated stream; %GUARD-OUTPUT with CLOSE-TARGET-P NIL). RAW-STDOUT is
+the defaulted stdout stream, or NIL."
   (let ((in (or input
                 (make-concatenated-stream
-                 #+sbcl (sb-sys:make-fd-stream 0 :input t :external-format :utf-8
-                                                 :buffering :full)
+                 #+sbcl (let ((fd (%std-fd sb-sys:*stdin*)))
+                          (if fd
+                              (sb-sys:make-fd-stream fd :input t :external-format :utf-8
+                                                        :buffering :full)
+                              *standard-input*))
                  #-sbcl *standard-input*)))
         (raw-out (or output
-                     #+sbcl (sb-sys:make-fd-stream 1 :output t :external-format :utf-8
-                                                     :buffering :full)
+                     #+sbcl (let ((fd (%std-fd sb-sys:*stdout*)))
+                              (if fd
+                                  (sb-sys:make-fd-stream fd :output t :external-format :utf-8
+                                                            :buffering :full)
+                                  *standard-output*))
                      #-sbcl *standard-output*)))
     (unless output
       ;; Nothing buffered on the old stdout stream can land between our lines.
