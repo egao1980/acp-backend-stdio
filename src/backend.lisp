@@ -30,8 +30,8 @@
 ;;; ACP-CONDITION-FOR the code, with RETRY / USE-VALUE.
 ;;;   Unparseable lines: answered -32700 "Parse error" with "id": null, and
 ;;;   non-object / bad-envelope lines -32600, then reading goes on. In peer
-;;;   mode that answer is rpc-backend-stdio's job (#14, 0.3.1); the dependency
-;;;   moves to that version when it is published. No second line parser here.
+;;;   mode that answer is rpc-backend-stdio's job (#14, fixed in 0.3.1, the
+;;;   version this system depends on). No second line parser here.
 ;;;
 ;;; Dispatch. The agent side defaults to :CONCURRENT (*AGENT-DISPATCH*):
 ;;;   * a session/prompt handler calls the client (session/request_permission,
@@ -147,6 +147,9 @@
 ;;;   when another process still holds the child's stdout (rpc-backend-stdio
 ;;;   #12) or closing a stream under a blocked reader hangs (#10, Windows);
 ;;;   such a stream is abandoned with a WARNING rather than waited for.
+;;;   Since rpc-backend-stdio 0.3.1 the transport's own close is bounded too
+;;;   (#12: a :GRACE option, default 3 s, then the warning
+;;;   STDIO-RPC-PIPE-HELD); the TIMEOUT + 10 s bound here stays the contract.
 ;;;   Idempotent: a second call returns the same value.
 ;;;   On an agent connection (from SERVE-ACP-AGENT) it closes the transport.
 

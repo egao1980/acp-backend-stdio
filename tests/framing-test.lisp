@@ -48,7 +48,7 @@
       (ok (eql 1 (response-id m)) "the first line written answers initialize"))))
 
 (deftest framing-invalid-json-is-a-parse-error-and-serving-goes-on
-  ;; rpc-backend-stdio#14: in peer mode the reader answers these (0.3.1)
+  ;; rpc-backend-stdio#14: in peer mode the reader answers these (fixed in 0.3.1)
   (with-raw-agent (raw)
     (raw-initialize raw)
     (raw-send raw "this is not json")

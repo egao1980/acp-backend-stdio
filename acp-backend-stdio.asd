@@ -4,7 +4,7 @@
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "acp-protocol" "0.1.0")
-               (:version "rpc-backend-stdio" "0.3.0")
+               (:version "rpc-backend-stdio" "0.3.1")
                "rpc-protocol" "rpc-protocol-json"
                (:version "process-protocol" "0.4.0")
                (:version "process-backend-uiop" "0.3.4")
