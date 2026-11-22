@@ -1,10 +1,14 @@
 (defpackage #:acp-backend-stdio
   (:use #:cl)
-  (:export #:+acp-stdio-backend-status+))
-
-(in-package #:acp-backend-stdio)
-
-;;; Skeleton. The ACP-1 contract (0.1.0) comes after acp-protocol 0.1.0; see
-;;; cl-stack/docs/capabilities/acp.md.
-
-(defparameter +acp-stdio-backend-status+ :skeleton)
+  (:documentation "stdio transport for acp-protocol (ACP-1): newline-delimited JSON-RPC 2.0
+over an agent process's stdin / stdout, and a client that spawns an agent subprocess
+or connects to a pair of streams. Built on rpc-backend-stdio's peer mode.")
+  (:export
+   ;; connections
+   #:acp-stdio-connection #:acp-stdio-connection-process
+   ;; agent side
+   #:serve-acp-agent #:stop-acp-agent
+   ;; client side
+   #:spawn-acp-agent #:connect-acp-streams #:wait-acp-connection #:close-acp-connection
+   ;; defaults
+   #:*agent-dispatch* #:*client-dispatch*))
