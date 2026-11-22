@@ -7,4 +7,7 @@ use to launch an ACP agent.
 
 Brief: [cl-stack/docs/capabilities/acp.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/acp.md).
 
-Status: skeleton. ACP-1 (0.1.0) follows acp-protocol 0.1.0.
+Status: **0.1.0 contracted** (ACP-1): `serve-acp-agent`, `stop-acp-agent`,
+`spawn-acp-agent`, `connect-acp-streams`, `wait-acp-connection`,
+`close-acp-connection`. The rules are in the header of `src/backend.lisp`;
+the tests run the scripted agent in-process over pipes and as a child SBCL.

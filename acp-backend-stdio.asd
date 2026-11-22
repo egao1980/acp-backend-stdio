@@ -1,19 +1,33 @@
 (defsystem "acp-backend-stdio"
-  :version "0.0.0"
-  :description "stdio transport backend for acp-protocol (newline-delimited JSON-RPC)"
+  :version "0.1.0"
+  :description "stdio transport for acp-protocol: newline-delimited JSON-RPC over an agent process's stdin / stdout (serve-acp-agent) and a client that spawns or connects to an agent (spawn-acp-agent, connect-acp-streams), through rpc-backend-stdio peer mode"
   :author "egao1980"
   :license "MIT"
+  :depends-on ((:version "acp-protocol" "0.1.0")
+               (:version "rpc-backend-stdio" "0.3.0")
+               "rpc-protocol" "rpc-protocol-json"
+               (:version "process-protocol" "0.4.0")
+               (:version "process-backend-uiop" "0.3.4")
+               "bordeaux-threads")
+  :properties (:cl-repo (:ci (:with ("dissect"))))
   :serial t
   :pathname "src"
-  :components ((:file "package"))
+  :components ((:file "package")
+               (:file "backend"))
   :in-order-to ((test-op (test-op "acp-backend-stdio/tests"))))
 
 (defsystem "acp-backend-stdio/tests"
-  :depends-on ("acp-backend-stdio" "rove")
+  :depends-on ("acp-backend-stdio" "rove" "bordeaux-threads" "json-protocol")
   :pathname "tests"
   :serial t
-  :components ((:file "package")
-               (:file "skeleton-test"))
+  :components (;; the scripted agent: in-process, and the child's (fixtures/agent-main.lisp)
+               (:file "fixtures/scripted-agent")
+               (:file "package")
+               (:file "support")
+               (:file "api-test")
+               (:file "pair-test")
+               (:file "framing-test")
+               (:file "subprocess-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
