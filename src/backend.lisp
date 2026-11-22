@@ -2,10 +2,9 @@
 
 ;;; ACP over stdio (contract ACP-1, 0.1.0).
 ;;;
-;;; GIVEN: the package, ACP-STDIO-CONNECTION and its PROCESS reader, the
-;;; dispatch defaults. STUBBED (%ACP1-PENDING): SERVE-ACP-AGENT,
-;;; STOP-ACP-AGENT, SPAWN-ACP-AGENT, CONNECT-ACP-STREAMS,
-;;; WAIT-ACP-CONNECTION, CLOSE-ACP-CONNECTION.
+;;; The package, ACP-STDIO-CONNECTION and its PROCESS reader, the dispatch
+;;; defaults, SERVE-ACP-AGENT, STOP-ACP-AGENT, SPAWN-ACP-AGENT,
+;;; CONNECT-ACP-STREAMS, WAIT-ACP-CONNECTION and CLOSE-ACP-CONNECTION.
 ;;;
 ;;; Framing (ACP spec, Transports / stdio). One JSON-RPC 2.0 message per
 ;;; line, UTF-8, LF. A message never contains a raw newline: JSON-RPC text
@@ -161,30 +160,471 @@
 
 (defclass acp-stdio-connection (acp-protocol:acp-connection)
   ((process :initarg :process :initform nil :reader acp-stdio-connection-process
-            :documentation "The spawned agent's PROCESS-PROTOCOL handle, or NIL."))
+            :documentation "The spawned agent's PROCESS-PROTOCOL handle, or NIL.")
+   ;; Internal state, under STATE-LOCK (broadcast on STATE-CV at every change).
+   (process-group-p :initform nil :accessor %process-group-p
+                    :documentation "PROCESS was launched with :PROCESS-GROUP T.")
+   (state-lock :initform (bt2:make-lock :name "acp-stdio") :reader %lock)
+   (state-cv :initform (bt2:make-condition-variable :name "acp-stdio") :reader %cv)
+   (stop-requested :initform nil :accessor %stop-requested
+                   :documentation "Agent side: STOP-ACP-AGENT was called.")
+   (stoppers :initform '() :accessor %stoppers
+             :documentation "Agent side: the request threads that called STOP-ACP-AGENT.")
+   (running :initform (make-hash-table :test 'equal) :reader %running
+            :documentation "Agent side: request id (EQUAL) → the %BOX of its running handler.")
+   (exited :initform nil :accessor %exited
+           :documentation "Client side: the exit watcher reaped PROCESS.")
+   (exit-code :initform nil :accessor %exit-code
+              :documentation "PROCESS's exit code once EXITED (NIL when the OS gave none).")
+   (close-state :initform nil :accessor %close-state
+                :documentation "NIL, :CLOSING or :CLOSED (CLOSE-ACP-CONNECTION).")
+   (close-value :initform nil :accessor %close-value))
   (:documentation "An ACP connection over an rpc-backend-stdio transport."))
 
+;;; --- deadlines and connection state ------------------------------------------------
+
+(defun %deadline (seconds)
+  (+ (get-internal-real-time) (round (* seconds internal-time-units-per-second))))
+
+(defun %seconds-left (deadline)
+  (/ (- deadline (get-internal-real-time)) internal-time-units-per-second))
+
+(defun %poll (seconds predicate)
+  "Call PREDICATE every 10 ms for SECONDS at most. → its value, or NIL."
+  (loop with deadline = (%deadline seconds)
+        for value = (funcall predicate)
+        when value return value
+        while (plusp (%seconds-left deadline))
+        do (sleep 0.01)))
+
+(defmacro %with-state ((connection) &body body)
+  "BODY under CONNECTION's state lock; waiters are woken afterwards."
+  (let ((c (gensym "CONNECTION")))
+    `(let ((,c ,connection))
+       (bt2:with-lock-held ((%lock ,c))
+         (multiple-value-prog1 (progn ,@body)
+           (bt2:condition-broadcast (%cv ,c)))))))
+
+(defun %await-state (connection seconds predicate)
+  "Wait until PREDICATE (called under the state lock) is true, or SECONDS
+passed (NIL: no limit). → its value, or NIL."
+  (let ((deadline (and seconds (%deadline seconds)))
+        (lock (%lock connection))
+        (cv (%cv connection)))
+    (bt2:with-lock-held (lock)
+      (loop
+        (let ((value (funcall predicate)))
+          (when value (return value)))
+        (let ((left (and deadline (%seconds-left deadline))))
+          (when (and left (<= left 0)) (return nil))
+          ;; Re-checked at least once a second.
+          (bt2:condition-wait cv lock :timeout (if left (min left 1) 1)))))))
+
+(defun %bounded (seconds what thunk)
+  "Run THUNK on a helper thread and wait SECONDS for it. → T when it finished
+in time; an error it signalled is signalled again here. One still running is
+abandoned with a WARNING (a stream close that blocks: rpc-backend-stdio #10,
+#12), → NIL."
+  (let* ((outcome (list nil))           ; (done-p . condition)
+         (thread (bt2:make-thread
+                  (lambda ()
+                    ;; Nothing may escape a thread function; the condition is
+                    ;; handed to the waiting caller instead.
+                    (handler-case (funcall thunk)
+                      (error (c) (setf (cdr outcome) c)))
+                    (setf (car outcome) t))
+                  :name "acp-stdio close")))
+    (declare (ignorable thread))
+    (cond ((%poll seconds (lambda () (car outcome)))
+           (when (cdr outcome) (error (cdr outcome)))
+           t)
+          (t (warn "acp-backend-stdio: ~A did not finish within ~A s; abandoned" what seconds)
+             nil))))
+
+;;; --- agent side: running requests and $/cancel_request ------------------------------
+
+(defstruct (%box (:constructor %make-box (id thread)))
+  "One agent request whose handler runs in THREAD. STATE (:RUNNING / :DONE),
+WRITING and PENDING are written only by THREAD itself (its own code, or an
+interrupt function running in it), so they need no lock."
+  id thread (state :running) (writing nil) (pending nil))
+
+(defvar *request-box* nil
+  "The %BOX of the agent request whose handler runs in this thread. Bound only
+inside the request wrapper, so it is NIL while rpc-backend-stdio writes the answer.")
+
+(defun %interrupt-request (connection request-id)
+  "$/cancel_request: signal ACP-REQUEST-CANCELLED in the thread of the running
+request REQUEST-ID (EQUAL). Unknown or finished ids are ignored. A thread in
+the middle of writing a line gets the signal right after that line (see
+%GUARD-OUTPUT), so no line is ever cut."
+  (let ((box (bt2:with-lock-held ((%lock connection))
+               (gethash request-id (%running connection)))))
+    (when (and box (eq :running (%box-state box)))
+      (handler-case
+          (bt2:interrupt-thread
+           (%box-thread box)
+           (lambda ()
+             (when (and (eq *request-box* box) (eq :running (%box-state box)))
+               (if (%box-writing box)
+                   (setf (%box-pending box) t)
+                   (error 'acp-protocol:acp-request-cancelled)))))
+        ;; The thread ended between the lookup and the interrupt: nothing to cancel.
+        (error () nil)))))
+
+;;; The agent's output stream. rpc-backend-stdio writes each line as
+;;; WRITE-STRING, a newline and FINISH-OUTPUT under its write lock. While a
+;;; request thread writes, an interrupt only marks the cancel PENDING; it is
+;;; signalled after the line's FINISH-OUTPUT, so the line is whole and the
+;;; write lock is released by the unwind. CLOSE-TARGET-P NIL (the defaulted
+;;; stdout) flushes the target and never closes it.
+
+(defclass %guard-output (trivial-gray-streams:fundamental-character-output-stream)
+  ((target :initarg :target :reader %guard-target)
+   (close-target-p :initarg :close-target-p :reader %guard-close-target-p)))
+
+(defun %begin-write ()
+  (let ((box *request-box*))
+    (when box (setf (%box-writing box) t))))
+
+(defmethod trivial-gray-streams:stream-write-char ((stream %guard-output) char)
+  (%begin-write)
+  (write-char char (%guard-target stream)))
+
+(defmethod trivial-gray-streams:stream-write-string ((stream %guard-output) string
+                                                     &optional (start 0) end)
+  (%begin-write)
+  (write-string string (%guard-target stream) :start start :end end)
+  string)
+
+(defmethod trivial-gray-streams:stream-line-column ((stream %guard-output))
+  nil)
+
+(defmethod trivial-gray-streams:stream-force-output ((stream %guard-output))
+  (force-output (%guard-target stream)))
+
+(defmethod trivial-gray-streams:stream-finish-output ((stream %guard-output))
+  (finish-output (%guard-target stream))
+  (let ((box *request-box*))
+    (when box
+      (setf (%box-writing box) nil)
+      (when (shiftf (%box-pending box) nil)
+        (error 'acp-protocol:acp-request-cancelled)))))
+
+(defmethod close ((stream %guard-output) &key abort)
+  (let ((target (%guard-target stream)))
+    (when (open-stream-p target)
+      (if (%guard-close-target-p stream)
+          (close target :abort abort)
+          (finish-output target))))
+  (call-next-method))
+
+(defun %agent-streams (input output)
+  "→ (values INPUT OUTPUT RAW-STDOUT) for the agent's transport. The defaulted
+stdin / stdout are UTF-8 streams on fd 0 / 1 (SBCL) inside wrappers whose
+close does not close them (a concatenated stream; %GUARD-OUTPUT with
+CLOSE-TARGET-P NIL). RAW-STDOUT is the defaulted stdout stream, or NIL."
+  (let ((in (or input
+                (make-concatenated-stream
+                 #+sbcl (sb-sys:make-fd-stream 0 :input t :external-format :utf-8
+                                                 :buffering :full)
+                 #-sbcl *standard-input*)))
+        (raw-out (or output
+                     #+sbcl (sb-sys:make-fd-stream 1 :output t :external-format :utf-8
+                                                     :buffering :full)
+                     #-sbcl *standard-output*)))
+    (unless output
+      ;; Nothing buffered on the old stdout stream can land between our lines.
+      (finish-output *standard-output*))
+    (values in
+            (make-instance '%guard-output :target raw-out :close-target-p (and output t))
+            (and (null output) raw-out))))
+
+(defun %incoming (connection kind &key agent-p (stdout *error-output*))
+  "The :ON-REQUEST / :ON-NOTIFICATION function of CONNECTION's transport: its
+ACP-CONNECTION-HANDLER with *ACP-INCOMING-KIND* bound. On the agent side
+*STANDARD-OUTPUT* is STDOUT (stray prints go to stderr), requests are
+registered by id for $/cancel_request, and $/cancel_request interrupts the
+running request after the agent's ACP-CANCEL-REQUEST."
+  (let ((handler (acp-protocol:acp-connection-handler connection)))
+    (ecase kind
+      (:request
+       (if (not agent-p)
+           (lambda (method params)
+             (let ((acp-protocol:*acp-incoming-kind* :request))
+               (funcall handler method params)))
+           (lambda (method params)
+             (let* ((*standard-output* stdout)
+                    (acp-protocol:*acp-incoming-kind* :request)
+                    (box (%make-box rpc-backend-stdio:*stdio-rpc-request-id*
+                                    (bt2:current-thread))))
+               (%with-state (connection)
+                 (setf (gethash (%box-id box) (%running connection)) box))
+               (unwind-protect
+                    (let ((*request-box* box))
+                      (handler-case (funcall handler method params)
+                        ;; A cancel that landed outside the handler's own
+                        ;; HANDLER-CASE: still acp-protocol's -32800 answer.
+                        (acp-protocol:acp-request-cancelled (c)
+                          (multiple-value-bind (code message data) (acp-protocol:acp-error-for c)
+                            (error 'rpc-protocol:rpc-error
+                                   :code code :message message :data data)))))
+                 ;; First: an interrupt arriving from now on does nothing.
+                 (setf (%box-state box) :done)
+                 (%with-state (connection)
+                   (when (eq box (gethash (%box-id box) (%running connection)))
+                     (remhash (%box-id box) (%running connection)))))))))
+      (:notification
+       (lambda (method params)
+         (let ((acp-protocol:*acp-incoming-kind* :notification)
+               (*standard-output* (if agent-p stdout *standard-output*)))
+           ;; The local peer's GF first (ACP-CANCEL-REQUEST for $/cancel_request).
+           (funcall handler method params)
+           (when (and agent-p (equal method "$/cancel_request") (hash-table-p params))
+             (multiple-value-bind (id present) (gethash "requestId" params)
+               (when present
+                 (%interrupt-request connection id))))))))))
+
+(defun %wire (connection transport &key agent-p (stdout *error-output*))
+  "Connect CONNECTION and TRANSPORT (made without handlers, so no reader runs
+yet), install the handlers, then start the reader: no message is handled
+before the connection is complete."
+  (setf (acp-protocol:acp-connection-remote connection)
+        (make-instance (if agent-p 'acp-protocol:remote-client 'acp-protocol:remote-agent)
+                       :connection connection)
+        (acp-protocol:acp-connection-transport connection) transport
+        (rpc-backend-stdio:stdio-rpc-transport-on-request transport)
+        (%incoming connection :request :agent-p agent-p :stdout stdout)
+        (rpc-backend-stdio:stdio-rpc-transport-on-notification transport)
+        (%incoming connection :notification :agent-p agent-p :stdout stdout))
+  ;; "Start the reader if needed"; with TIMEOUT 0 it returns at once.
+  (rpc-backend-stdio:stdio-rpc-transport-wait-closed transport :timeout 0)
+  transport)
+
+;;; --- agent side: serving ---------------------------------------------------------
+
+(defun %await-stoppers (connection dispatch seconds)
+  "Let the request that called STOP-ACP-AGENT write its answer (SECONDS at most)."
+  (let ((threads (bt2:with-lock-held ((%lock connection))
+                   (copy-list (%stoppers connection)))))
+    (when threads
+      (if (eq dispatch :concurrent)
+          ;; A :CONCURRENT worker ends only after its answer was written.
+          (%poll seconds (lambda () (notany #'bt2:thread-alive-p threads)))
+          ;; :SERIAL: the dispatcher writes the answer right after the handler.
+          (progn
+            (%poll seconds (lambda ()
+                             (bt2:with-lock-held ((%lock connection))
+                               (zerop (hash-table-count (%running connection))))))
+            (sleep 0.2))))))
+
 (defun serve-acp-agent (agent &key input output (dispatch *agent-dispatch*))
-  (declare (ignore agent input output dispatch))
-  (%acp1-pending 'serve-acp-agent))
+  (check-type dispatch (member :concurrent :serial))
+  (check-type agent acp-protocol:acp-agent)
+  (let ((stdout *error-output*))
+    (multiple-value-bind (in out raw-stdout) (%agent-streams input output)
+      (let* ((connection (make-instance 'acp-stdio-connection :role :agent :local agent))
+             (transport (rpc-backend-stdio:make-stdio-rpc-transport
+                         :input in :output out :dispatch dispatch)))
+        (%wire connection transport :agent-p t :stdout stdout)
+        (unwind-protect
+             (progn
+               (loop until (or (%stop-requested connection)
+                               (rpc-backend-stdio:stdio-rpc-transport-wait-closed
+                                transport :timeout 0.1)))
+               (when (%stop-requested connection)
+                 (%await-stoppers connection dispatch 3)))
+          (%bounded 10 "closing the agent's transport"
+                    (lambda () (rpc-backend-stdio:close-stdio-rpc-transport transport :timeout 0)))
+          (when raw-stdout
+            (handler-case (finish-output raw-stdout)
+              (stream-error () nil))))
+        connection))))
 
 (defun stop-acp-agent (connection)
-  (declare (ignore connection))
-  (%acp1-pending 'stop-acp-agent))
+  (check-type connection acp-stdio-connection)
+  (%with-state (connection)
+    (setf (%stop-requested connection) t)
+    (let ((box *request-box*))
+      ;; Called from one of this connection's requests: serve lets it answer.
+      (when (and box (eq box (gethash (%box-id box) (%running connection))))
+        (pushnew (bt2:current-thread) (%stoppers connection)))))
+  t)
+
+;;; --- client side: the agent's exit -------------------------------------------------
+
+(defclass %process-transport (rpc-backend-stdio:stdio-rpc-transport)
+  ((connection :initarg :connection :reader %transport-connection))
+  (:documentation "The transport of a spawned agent: \"peer closed\" becomes the
+agent's exit (ACP-INTERNAL-ERROR with \"exitCode\")."))
+
+(defun %peer-closed-error-p (condition)
+  "rpc-backend-stdio's \"peer closed\" RPC-ERROR (-32603, no data), not a timeout
+and not an error answer of the agent."
+  (and (not (typep condition 'rpc-backend-stdio:stdio-rpc-timeout))
+       (eql (rpc-protocol:rpc-error-code condition) rpc-protocol:+internal-error+)
+       (null (rpc-protocol:rpc-error-data condition))
+       (let ((message (rpc-protocol:rpc-error-message condition)))
+         (and (stringp message) (eql 0 (search "stdio RPC peer closed" message))))))
+
+(defun %signal-exited (connection)
+  "Signal the RPC-ERROR -32603 of an agent that exited; acp-protocol makes it
+an ACP-INTERNAL-ERROR with the same message and data."
+  (%await-state connection 5 (lambda () (%exited connection)))
+  (let ((code (and (%exited connection) (%exit-code connection)))
+        (data (make-hash-table :test 'equal)))
+    (setf (gethash "exitCode" data) (if (integerp code) code :null))
+    (error 'rpc-protocol:rpc-error
+           :code rpc-protocol:+internal-error+ :data data
+           :message (if (integerp code)
+                        (format nil "The ACP agent exited with code ~D" code)
+                        "The ACP agent exited or closed its stdout (exit code unknown)"))))
+
+(defmethod rpc-protocol:backend-rpc-call :around
+    ((transport %process-transport) method params &key timeout id)
+  (declare (ignore method params timeout id))
+  ;; HANDLER-CASE, not HANDLER-BIND: rpc-backend-stdio may signal "peer closed"
+  ;; under its state lock, and %SIGNAL-EXITED waits; unwind first.
+  (handler-case (call-next-method)
+    ((and rpc-protocol:rpc-error (satisfies %peer-closed-error-p)) ()
+      (%signal-exited (%transport-connection transport)))))
+
+(defmethod rpc-protocol:backend-rpc-notify :around
+    ((transport %process-transport) method params)
+  (declare (ignore method params))
+  (let ((connection (%transport-connection transport)))
+    (handler-case (call-next-method)
+      ;; A write to a dead agent's stdin.
+      (stream-error (e)
+        (if (%await-state connection 1 (lambda () (%exited connection)))
+            (%signal-exited connection)
+            (error e))))))
+
+(defun %start-exit-watcher (connection)
+  "The one thread that reaps the agent: records its exit code when it exits."
+  (let ((process (acp-stdio-connection-process connection)))
+    (bt2:make-thread
+     (lambda ()
+       (let ((code (handler-case (process-protocol:wait process)
+                     ;; Nothing may escape the thread; the code is then unknown.
+                     (error () nil))))
+         (%with-state (connection)
+           (setf (%exit-code connection) code
+                 (%exited connection) t))))
+     :name "acp-stdio exit watcher")))
+
+;;; --- client side: connections ------------------------------------------------------
+
+(defun %client-connection (client input output dispatch &key process process-group-p)
+  (check-type dispatch (member :reader :serial :concurrent))
+  (let ((connection (make-instance 'acp-stdio-connection
+                                   :role :client :process process
+                                   :local (or client (make-instance 'acp-protocol:acp-client))))
+        (transport (rpc-backend-stdio:make-stdio-rpc-transport
+                    :input input :output output :dispatch dispatch)))
+    (when process
+      ;; No reader thread exists yet, and no other thread knows TRANSPORT.
+      (change-class transport '%process-transport :connection connection)
+      (setf (%process-group-p connection) process-group-p)
+      (%start-exit-watcher connection))
+    (%wire connection transport)
+    (values connection (acp-protocol:acp-connection-remote connection))))
 
 (defun spawn-acp-agent (argv &key env directory client (dispatch *client-dispatch*)
                                   (error-output :interactive))
-  (declare (ignore argv env directory client dispatch error-output))
-  (%acp1-pending 'spawn-acp-agent))
+  (check-type argv (cons string list))
+  (check-type dispatch (member :reader :serial :concurrent))
+  (let* ((group-p (and (process-protocol:supports-p :process-group) t))
+         (process (apply #'process-protocol:launch argv
+                         :input :stream :output :stream :error-output error-output
+                         :external-format :utf-8 :env env :directory directory
+                         (and group-p '(:process-group t))))
+         (done nil))
+    (unwind-protect
+         (multiple-value-prog1
+             (%client-connection client (process-protocol:stdout process)
+                                 (process-protocol:stdin process) dispatch
+                                 :process process :process-group-p group-p)
+           (setf done t))
+      (unless done
+        (process-protocol:kill process :force t :tree group-p)))))
 
 (defun connect-acp-streams (client input output &key (dispatch *client-dispatch*))
-  (declare (ignore client input output dispatch))
-  (%acp1-pending 'connect-acp-streams))
+  (%client-connection client input output dispatch))
 
 (defun wait-acp-connection (connection &key timeout)
-  (declare (ignore connection timeout))
-  (%acp1-pending 'wait-acp-connection))
+  (check-type connection acp-stdio-connection)
+  (check-type timeout (or null (real 0)))
+  (let ((deadline (and timeout (%deadline timeout)))
+        (transport (acp-protocol:acp-connection-transport connection)))
+    (and (rpc-backend-stdio:stdio-rpc-transport-wait-closed transport :timeout timeout)
+         (if (acp-stdio-connection-process connection)
+             (and (%await-state connection
+                                (and deadline (max 0 (%seconds-left deadline)))
+                                (lambda () (%exited connection)))
+                  (%exit-code connection))
+             t))))
+
+;;; --- close -------------------------------------------------------------------------
+
+(defun %close-stdin (process)
+  "EOF on the agent's stdin. A dead agent's pipe fails the flush: it is gone."
+  (let ((stdin (process-protocol:stdin process)))
+    (when stdin
+      (handler-case (close stdin)
+        (stream-error () (handler-case (close stdin :abort t)
+                           (stream-error () nil)))))))
+
+(defun %close-now (connection timeout force)
+  "→ the exit code (or NIL), or T without a process. At most TIMEOUT + 9 s."
+  (let ((transport (acp-protocol:acp-connection-transport connection))
+        (process (acp-stdio-connection-process connection)))
+    (flet ((close-transport (seconds &rest keys)
+             (when transport
+               (%bounded seconds "closing the ACP transport"
+                         (lambda ()
+                           (apply #'rpc-backend-stdio:close-stdio-rpc-transport
+                                  transport :timeout 0 keys))))))
+      (cond
+        ((eq :agent (acp-protocol:acp-connection-role connection))
+         (stop-acp-agent connection)
+         (close-transport 8)
+         t)
+        ((null process)
+         (close-transport 8)
+         t)
+        (t
+         ;; 1. EOF on the child's stdin (a Windows pipe close can block: #10).
+         (%bounded 1 "closing the agent's stdin" (lambda () (%close-stdin process)))
+         ;; 2. A graceful exit at EOF.
+         (unless force
+           (%await-state connection timeout (lambda () (%exited connection))))
+         ;; 3. Else kill it, with its tree when it leads a process group.
+         (unless (bt2:with-lock-held ((%lock connection)) (%exited connection))
+           (handler-case (process-protocol:kill process :force t
+                                                        :tree (%process-group-p connection))
+             (process-protocol:process-error () nil))
+           (%await-state connection 2 (lambda () (%exited connection))))
+         ;; 4. The reader, now that the child is gone (rpc-backend-stdio bounds
+         ;;    a stdout another process still holds, #12).
+         (close-transport 6 :grace 2 :force t)
+         (bt2:with-lock-held ((%lock connection))
+           (and (%exited connection) (%exit-code connection))))))))
 
 (defun close-acp-connection (connection &key (timeout 5) force)
-  (declare (ignore connection timeout force))
-  (%acp1-pending 'close-acp-connection))
+  (check-type connection acp-stdio-connection)
+  (check-type timeout (real 0))
+  (let ((first-p (%with-state (connection)
+                   (and (null (%close-state connection))
+                        (setf (%close-state connection) :closing)))))
+    (unless first-p
+      ;; A close in progress elsewhere: wait for it (bounded), then its value.
+      (%await-state connection (+ timeout 10)
+                    (lambda () (eq :closed (%close-state connection))))
+      (return-from close-acp-connection (%close-value connection)))
+    (let ((value nil))
+      (unwind-protect (setf value (%close-now connection timeout force))
+        (%with-state (connection)
+          (setf (%close-value connection) value
+                (%close-state connection) :closed)))
+      value)))

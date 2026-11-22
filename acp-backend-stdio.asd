@@ -8,7 +8,7 @@
                "rpc-protocol" "rpc-protocol-json"
                (:version "process-protocol" "0.4.0")
                (:version "process-backend-uiop" "0.3.4")
-               "bordeaux-threads")
+               "bordeaux-threads" "trivial-gray-streams")
   :properties (:cl-repo (:ci (:with ("dissect"))))
   :serial t
   :pathname "src"
