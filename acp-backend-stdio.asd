@@ -17,7 +17,7 @@
   :in-order-to ((test-op (test-op "acp-backend-stdio/tests"))))
 
 (defsystem "acp-backend-stdio/tests"
-  :depends-on ("acp-backend-stdio" "rove" "bordeaux-threads" "json-protocol"
+  :depends-on ("acp-backend-stdio" "rove" "bordeaux-threads" (:version "json-protocol" "0.2.3")
                (:version "json-backend-jzon" "0.2.3"))
   :pathname "tests"
   :serial t
