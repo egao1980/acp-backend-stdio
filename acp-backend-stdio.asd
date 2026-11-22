@@ -4,7 +4,7 @@
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "acp-protocol" "0.1.0")
-               (:version "rpc-backend-stdio" "0.3.1")
+               (:version "rpc-backend-stdio" "0.3.2")
                "rpc-protocol" "rpc-protocol-json"
                (:version "process-protocol" "0.4.0")
                (:version "process-backend-uiop" "0.3.4")
@@ -17,7 +17,8 @@
   :in-order-to ((test-op (test-op "acp-backend-stdio/tests"))))
 
 (defsystem "acp-backend-stdio/tests"
-  :depends-on ("acp-backend-stdio" "rove" "bordeaux-threads" "json-protocol")
+  :depends-on ("acp-backend-stdio" "rove" "bordeaux-threads" "json-protocol"
+               (:version "json-backend-jzon" "0.2.3"))
   :pathname "tests"
   :serial t
   :components (;; the scripted agent: in-process, and the child's (fixtures/agent-main.lisp)
