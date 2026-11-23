@@ -3,7 +3,7 @@
 ;;; The API surface: exports, version, defaults, argument validation.
 
 (deftest exports-and-version
-  (ok (equal "0.1.0" (asdf:component-version (asdf:find-system "acp-backend-stdio"))))
+  (ok (equal "0.1.1" (asdf:component-version (asdf:find-system "acp-backend-stdio"))))
   (dolist (name '("SERVE-ACP-AGENT" "STOP-ACP-AGENT" "SPAWN-ACP-AGENT" "CONNECT-ACP-STREAMS"
                   "WAIT-ACP-CONNECTION" "CLOSE-ACP-CONNECTION" "ACP-STDIO-CONNECTION-PROCESS"))
     (multiple-value-bind (sym status) (find-symbol name "ACP-BACKEND-STDIO")

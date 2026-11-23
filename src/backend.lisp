@@ -48,6 +48,13 @@
 ;;;   session/set_mode while a prompt runs); the agent's own state must be
 ;;;   thread-safe. :SERIAL is accepted (one request at a time; cancellation
 ;;;   only between requests); :READER is refused with a TYPE-ERROR.
+;;;   0.1.1 (egao1980/cl-stack-code#45): "initialize" is a barrier
+;;;   (rpc-backend-stdio 0.4.1 :BARRIER-METHODS): the requests and
+;;;   notifications a client writes after it without waiting for its answer
+;;;   are dispatched once that answer was written, so they are handled after
+;;;   initialize (not answered -32600 "Request before initialize") and the
+;;;   initialize answer is the first one out. Under :SERIAL they are in order
+;;;   anyway.
 ;;; The client side defaults to :READER (*CLIENT-DISPATCH*): the client GFs
 ;;;   (session/update, session/request_permission, fs/*, terminal/*) run on
 ;;;   the reader thread, so every session/update the agent sent before a
@@ -439,7 +446,10 @@ before the connection is complete."
     (multiple-value-bind (in out raw-stdout) (%agent-streams input output)
       (let* ((connection (make-instance 'acp-stdio-connection :role :agent :local agent))
              (transport (rpc-backend-stdio:make-stdio-rpc-transport
-                         :input in :output out :dispatch dispatch)))
+                         :input in :output out :dispatch dispatch
+                         ;; 0.1.1 (cl-stack-code#45): what a client pipelines
+                         ;; after initialize is handled after it
+                         :barrier-methods (list "initialize"))))
         (%wire connection transport :agent-p t :stdout stdout)
         (unwind-protect
              (progn
